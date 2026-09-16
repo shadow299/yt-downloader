@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 from yt_dlp import YoutubeDL
@@ -18,12 +19,34 @@ class StopDownloadRequested(KeyboardInterrupt):
     pass
 
 
+class _YdlLogger:
+    """Bridge yt-dlp log messages into the UI event queue."""
+
+    def __init__(self, emit) -> None:
+        self._emit = emit
+
+    def debug(self, msg: str) -> None:
+        # yt-dlp funnels a lot of noisy [debug] lines through .debug(); skip them.
+        if isinstance(msg, str) and msg.startswith("[debug] "):
+            return
+        self._emit("info", str(msg))
+
+    def info(self, msg: str) -> None:
+        self._emit("info", str(msg))
+
+    def warning(self, msg: str) -> None:
+        self._emit("warning", str(msg))
+
+    def error(self, msg: str) -> None:
+        self._emit("error", str(msg))
+
+
 class DownloaderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("YouTube Downloader ")
         self.root.geometry("860x560")
-        self.root.minsize(820, 520)
+        self.root.minsize(560, 360)
         self._set_window_icon()
 
         self.event_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
@@ -54,8 +77,37 @@ class DownloaderApp:
         self.root.after(120, self._process_events)
 
     def _build_ui(self) -> None:
-        root_frame = ttk.Frame(self.root, padding=16)
-        root_frame.pack(fill=tk.BOTH, expand=True)
+        # Outer scrollable container so the whole window content stays reachable
+        # when the window is small — otherwise the Logs panel gets clipped.
+        outer = ttk.Frame(self.root)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        self.main_canvas = tk.Canvas(
+            outer,
+            borderwidth=0,
+            highlightthickness=0,
+            background=self.root.cget("background"),
+        )
+        main_scroll = ttk.Scrollbar(outer, orient="vertical", command=self.main_canvas.yview)
+        self.main_canvas.configure(yscrollcommand=main_scroll.set)
+
+        main_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.main_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        root_frame = ttk.Frame(self.main_canvas, padding=16)
+        self.main_window_id = self.main_canvas.create_window(
+            (0, 0), window=root_frame, anchor="nw"
+        )
+        root_frame.bind(
+            "<Configure>",
+            lambda _e: self.main_canvas.configure(
+                scrollregion=self.main_canvas.bbox("all")
+            ),
+        )
+        self.main_canvas.bind(
+            "<Configure>",
+            lambda e: self.main_canvas.itemconfigure(self.main_window_id, width=e.width),
+        )
 
         style = ttk.Style(self.root)
         if "vista" in style.theme_names():
@@ -182,8 +234,11 @@ class DownloaderApp:
         self.stop_button = ttk.Button(button_frame, text="Stop", command=self._stop_download, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
 
-        progress_frame = ttk.LabelFrame(root_frame, text="Progress", padding=12)
-        progress_frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
+        paned = ttk.PanedWindow(root_frame, orient=tk.VERTICAL)
+        paned.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
+
+        progress_frame = ttk.LabelFrame(paned, text="Progress", padding=12)
+        paned.add(progress_frame, weight=3)
 
         ttk.Label(
             progress_frame,
@@ -198,6 +253,7 @@ class DownloaderApp:
             canvas_holder,
             borderwidth=0,
             highlightthickness=0,
+            height=180,
             background=self.root.cget("background"),
         )
         self.items_scrollbar = ttk.Scrollbar(
@@ -223,7 +279,6 @@ class DownloaderApp:
             "<Configure>",
             lambda e: self.items_canvas.itemconfigure(self.items_window_id, width=e.width),
         )
-        self._bind_mousewheel(self.items_canvas)
 
         note = ttk.Label(
             progress_frame,
@@ -231,6 +286,33 @@ class DownloaderApp:
             foreground="#444",
         )
         note.pack(anchor=tk.W, pady=(12, 0), side=tk.BOTTOM)
+
+        logs_frame = ttk.LabelFrame(paned, text="Logs", padding=8)
+        paned.add(logs_frame, weight=2)
+
+        log_scroll = ttk.Scrollbar(logs_frame, orient="vertical")
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.log_text = tk.Text(
+            logs_frame,
+            height=8,
+            wrap="none",
+            yscrollcommand=log_scroll.set,
+            background="#111",
+            foreground="#dcdcdc",
+            insertbackground="#dcdcdc",
+            state="disabled",
+        )
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_scroll.configure(command=self.log_text.yview)
+
+        self.log_text.tag_configure("info", foreground="#dcdcdc")
+        self.log_text.tag_configure("success", foreground="#80d080")
+        self.log_text.tag_configure("warning", foreground="#f0b040")
+        self.log_text.tag_configure("error", foreground="#ff6060")
+
+        # Single global wheel dispatcher: scrolls whichever nested area is under the pointer.
+        self._setup_global_wheel_scrolling()
 
     def _build_entry_row(
         self,
@@ -457,6 +539,7 @@ class DownloaderApp:
             "ignoreerrors": True,
             "progress_hooks": [hook],
             "match_filter": match_filter,
+            "logger": _YdlLogger(self._emit_log),
             "quiet": True,
             "no_warnings": True,
             "concurrent_fragment_downloads": 4,
@@ -466,37 +549,62 @@ class DownloaderApp:
         }
         ydl_opts.update(self._build_ydl_format_options(quality, output_format))
 
+        links = source if isinstance(source, list) else [source]
+        total_links = len(links)
+        successes = 0
+        failures: list[tuple[str, str]] = []
         aborted = False
+
+        self._emit_log("info", f"Starting batch of {total_links} link(s).")
+
         try:
             with YoutubeDL(ydl_opts) as ydl:
-                links = source if isinstance(source, list) else [source]
-                for link in links:
+                for i, link in enumerate(links, 1):
                     if self.stop_requested.is_set():
                         aborted = True
                         break
+                    self._emit_log("info", f"[{i}/{total_links}] Starting: {link}")
                     try:
                         ydl.download([link])
                     except StopDownloadRequested:
                         aborted = True
                         break
+                    except KeyboardInterrupt:
+                        aborted = True
+                        break
+                    except Exception as exc:
+                        # Isolate per-URL failures so one bad link never kills the batch.
+                        failures.append((link, str(exc)))
+                        self._emit_log("error", f"[{i}/{total_links}] Failed: {exc}")
+                        continue
+
                     if self.stop_requested.is_set():
                         aborted = True
                         break
+                    successes += 1
+                    self._emit_log("success", f"[{i}/{total_links}] Completed")
         except StopDownloadRequested:
             aborted = True
         except Exception as exc:
-            if self.stop_requested.is_set():
-                aborted = True
-            else:
-                self._cleanup_partial_files(destination, session_files)
-                self.event_queue.put(("error", {"message": str(exc)}))
-                return
+            # Only unrecoverable outer errors (e.g. YoutubeDL init) end up here.
+            self._cleanup_partial_files(destination, session_files)
+            self._emit_log("error", f"Fatal error: {exc}")
+            self.event_queue.put(("error", {"message": str(exc)}))
+            return
 
         if aborted or self.stop_requested.is_set():
             self._cleanup_partial_files(destination, session_files)
-            self.event_queue.put(("stopped", {"message": "Download stopped by user."}))
+            msg = f"Stopped. Completed {successes} of {total_links}."
+            if failures:
+                msg += f" {len(failures)} failed."
+            self._emit_log("warning", msg)
+            self.event_queue.put(("stopped", {"message": msg}))
         else:
-            self.event_queue.put(("done", {"message": "Download task completed."}))
+            msg = f"Completed {successes} of {total_links}."
+            if failures:
+                msg += f" {len(failures)} failed."
+            self._emit_log("success" if not failures else "warning", msg)
+            self.event_queue.put(("done", {"message": msg}))
 
     @staticmethod
     def _cleanup_partial_files(destination: str, session_files: set[str]) -> None:
@@ -673,6 +781,9 @@ class DownloaderApp:
             elif event == "item_finished":
                 self._mark_item_finished(payload)
 
+            elif event == "log":
+                self._append_log(payload.get("level", "info"), payload.get("message", ""))
+
             elif event == "done":
                 self.status_text.set(payload.get("message", "Done"))
                 self._set_ui_busy(False)
@@ -808,28 +919,58 @@ class DownloaderApp:
         row["status_var"].set(f"Finished: {payload.get('filename', title)}")
         row["finished"] = True
 
-    def _bind_mousewheel(self, canvas: tk.Canvas) -> None:
+    def _emit_log(self, level: str, message: str) -> None:
+        # Called from any thread; safely enqueue for the main-thread pump.
+        self.event_queue.put(("log", {"level": level, "message": message}))
+
+    def _append_log(self, level: str, message: str) -> None:
+        # Called only from the main thread via _process_events.
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {message}\n"
+        tag = level if level in {"info", "success", "warning", "error"} else "info"
+        self.log_text.configure(state="normal")
+        self.log_text.insert(tk.END, line, tag)
+        # Cap growth: keep the last ~2000 lines.
+        line_count = int(self.log_text.index("end-1c").split(".")[0])
+        if line_count > 2000:
+            self.log_text.delete("1.0", f"{line_count - 2000}.0")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state="disabled")
+
+    def _setup_global_wheel_scrolling(self) -> None:
+        # Route a single mouse-wheel binding to whichever scrollable area the
+        # pointer is currently over (per-item list, log text, or the whole window).
         def on_wheel(event: tk.Event) -> None:
             if getattr(event, "num", None) == 4:
-                canvas.yview_scroll(-3, "units")
+                step = -3
             elif getattr(event, "num", None) == 5:
-                canvas.yview_scroll(3, "units")
+                step = 3
             else:
                 delta = getattr(event, "delta", 0)
-                canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+                step = int(-1 * (delta / 120))
+                if step == 0:
+                    step = -1 if delta > 0 else 1
 
-        def bind_all(_e: tk.Event) -> None:
-            canvas.bind_all("<MouseWheel>", on_wheel)
-            canvas.bind_all("<Button-4>", on_wheel)
-            canvas.bind_all("<Button-5>", on_wheel)
+            try:
+                widget = self.root.winfo_containing(event.x_root, event.y_root)
+            except tk.TclError:
+                return
 
-        def unbind_all(_e: tk.Event) -> None:
-            canvas.unbind_all("<MouseWheel>")
-            canvas.unbind_all("<Button-4>")
-            canvas.unbind_all("<Button-5>")
+            while widget is not None:
+                if widget is self.items_canvas:
+                    self.items_canvas.yview_scroll(step, "units")
+                    return
+                if widget is self.log_text:
+                    self.log_text.yview_scroll(step, "units")
+                    return
+                if widget is self.main_canvas:
+                    self.main_canvas.yview_scroll(step, "units")
+                    return
+                widget = getattr(widget, "master", None)
 
-        canvas.bind("<Enter>", bind_all)
-        canvas.bind("<Leave>", unbind_all)
+        self.root.bind_all("<MouseWheel>", on_wheel, add="+")
+        self.root.bind_all("<Button-4>", on_wheel, add="+")
+        self.root.bind_all("<Button-5>", on_wheel, add="+")
 
     def _set_window_icon(self) -> None:
         # Look for icon.ico next to the script, or inside the PyInstaller bundle.
