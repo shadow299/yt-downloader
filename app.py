@@ -4,6 +4,7 @@ import platform
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -20,9 +21,10 @@ class StopDownloadRequested(KeyboardInterrupt):
 class DownloaderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("YouTube Downloader (yt-dlp)")
+        self.root.title("YouTube Downloader ")
         self.root.geometry("860x560")
         self.root.minsize(820, 520)
+        self._set_window_icon()
 
         self.event_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
         self.download_thread: threading.Thread | None = None
@@ -828,6 +830,20 @@ class DownloaderApp:
 
         canvas.bind("<Enter>", bind_all)
         canvas.bind("<Leave>", unbind_all)
+
+    def _set_window_icon(self) -> None:
+        # Look for icon.ico next to the script, or inside the PyInstaller bundle.
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        ico_path = os.path.join(base, "icon.ico")
+        png_path = os.path.join(base, "icon.png")
+        try:
+            if os.path.isfile(ico_path):
+                self.root.iconbitmap(ico_path)
+                return
+            if os.path.isfile(png_path):
+                self.root.iconphoto(True, tk.PhotoImage(file=png_path))
+        except tk.TclError:
+            pass
 
     @staticmethod
     def _is_valid_http(text: str) -> bool:
