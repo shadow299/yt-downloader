@@ -1,5 +1,8 @@
 import os
+import platform
 import queue
+import shutil
+import subprocess
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -22,6 +25,7 @@ class DownloaderApp:
         self.download_thread: threading.Thread | None = None
         self.is_downloading = False
         self.stop_requested = threading.Event()
+        self.installing_ffmpeg = False
 
         self.mode_single = tk.BooleanVar(value=True)
         self.mode_playlist = tk.BooleanVar(value=False)
@@ -40,6 +44,7 @@ class DownloaderApp:
 
         self._build_ui()
         self._apply_mode("single")
+        self._refresh_ffmpeg_warning()
         self.root.after(120, self._process_events)
 
     def _build_ui(self) -> None:
@@ -63,6 +68,21 @@ class DownloaderApp:
             font=("Segoe UI", 10),
         )
         subtitle.pack(anchor=tk.W, pady=(2, 14))
+
+        self.ffmpeg_warning_frame = ttk.Frame(root_frame, padding=(10, 8))
+        self.ffmpeg_warning_label = ttk.Label(
+            self.ffmpeg_warning_frame,
+            text="",
+            foreground="#a55b00",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.ffmpeg_warning_label.pack(side=tk.LEFT)
+        self.ffmpeg_install_button = ttk.Button(
+            self.ffmpeg_warning_frame,
+            text="Install",
+            command=self._install_ffmpeg,
+        )
+        self.ffmpeg_install_button.pack(side=tk.RIGHT)
 
         mode_frame = ttk.LabelFrame(root_frame, text="Mode", padding=10)
         mode_frame.pack(fill=tk.X)
@@ -250,6 +270,15 @@ class DownloaderApp:
             messagebox.showwarning("Busy", "A download is already running.")
             return
 
+        if not self._is_ffmpeg_installed():
+            proceed = messagebox.askyesno(
+                "FFmpeg Missing",
+                "ffmpeg is not installed. click install to install it.\n\n"
+                "You can continue, but some formats may fail or download at lower quality. Continue?",
+            )
+            if not proceed:
+                return
+
         mode = self._active_mode()
         destination = self.dest_path.get().strip()
 
@@ -384,6 +413,95 @@ class DownloaderApp:
             else:
                 self.event_queue.put(("error", {"message": str(exc)}))
 
+    def _install_ffmpeg(self) -> None:
+        if self.installing_ffmpeg:
+            messagebox.showinfo("FFmpeg", "Installation is already in progress.")
+            return
+        if self._is_ffmpeg_installed():
+            self._refresh_ffmpeg_warning()
+            messagebox.showinfo("FFmpeg", "FFmpeg is already installed.")
+            return
+
+        confirm = messagebox.askyesno(
+            "Install FFmpeg",
+            "ffmpeg is not installed. click install to install it.\n\nProceed with automatic installation?",
+        )
+        if not confirm:
+            return
+
+        self.installing_ffmpeg = True
+        self.ffmpeg_install_button.configure(state=tk.DISABLED, text="Installing...")
+        thread = threading.Thread(target=self._run_ffmpeg_install, daemon=True)
+        thread.start()
+
+    def _run_ffmpeg_install(self) -> None:
+        system_name = platform.system().lower()
+        commands = self._ffmpeg_install_commands(system_name)
+
+        attempted: list[str] = []
+        for cmd in commands:
+            attempted.append(cmd)
+            try:
+                result = subprocess.run(
+                    cmd,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    shell=True,
+                )
+            except OSError:
+                continue
+
+            if result.returncode == 0:
+                if self._is_ffmpeg_installed():
+                    self.event_queue.put(("ffmpeg_installed", {}))
+                    return
+
+        self.event_queue.put(
+            (
+                "ffmpeg_install_failed",
+                {
+                    "system": system_name,
+                    "attempted": attempted,
+                },
+            )
+        )
+
+    @staticmethod
+    def _ffmpeg_install_commands(system_name: str) -> list[str]:
+        if system_name == "windows":
+            return [
+                "winget install -e --id Gyan.FFmpeg",
+                "choco install ffmpeg -y",
+                "scoop install ffmpeg",
+            ]
+        if system_name == "darwin":
+            return ["brew install ffmpeg"]
+
+        # Linux fallbacks for common distros/package managers.
+        return [
+            "sudo apt update && sudo apt install -y ffmpeg",
+            "sudo dnf install -y ffmpeg",
+            "sudo yum install -y ffmpeg",
+            "sudo pacman -S --noconfirm ffmpeg",
+            "sudo zypper install -y ffmpeg",
+            "sudo apk add ffmpeg",
+        ]
+
+    @staticmethod
+    def _is_ffmpeg_installed() -> bool:
+        return shutil.which("ffmpeg") is not None
+
+    def _refresh_ffmpeg_warning(self) -> None:
+        if self._is_ffmpeg_installed():
+            self.ffmpeg_warning_frame.pack_forget()
+            return
+
+        self.ffmpeg_warning_label.configure(
+            text="ffmpeg is not installed. click install to install it."
+        )
+        self.ffmpeg_warning_frame.pack(fill=tk.X, pady=(0, 10))
+
     def _process_events(self) -> None:
         while True:
             try:
@@ -425,6 +543,28 @@ class DownloaderApp:
                 self.status_text.set("Error")
                 self._set_ui_busy(False)
                 messagebox.showerror("Download Error", payload.get("message", "Unknown error"))
+
+            elif event == "ffmpeg_installed":
+                self.installing_ffmpeg = False
+                self.ffmpeg_install_button.configure(state=tk.NORMAL, text="Install")
+                self._refresh_ffmpeg_warning()
+                messagebox.showinfo("FFmpeg", "FFmpeg installed successfully. You can now download/merge best quality formats.")
+
+            elif event == "ffmpeg_install_failed":
+                self.installing_ffmpeg = False
+                self.ffmpeg_install_button.configure(state=tk.NORMAL, text="Install")
+                self._refresh_ffmpeg_warning()
+                system_name = payload.get("system", "unknown")
+                attempted = payload.get("attempted", [])
+                attempted_text = "\n".join(attempted) if attempted else "No command could be started."
+                messagebox.showwarning(
+                    "FFmpeg Install Failed",
+                    "Automatic FFmpeg installation failed.\n"
+                    f"OS detected: {system_name}\n\n"
+                    "Attempted commands:\n"
+                    f"{attempted_text}\n\n"
+                    "Please install FFmpeg manually and restart this app.",
+                )
 
         self.root.after(120, self._process_events)
 
