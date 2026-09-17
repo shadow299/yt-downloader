@@ -733,7 +733,7 @@ class DownloaderApp:
     def _ffmpeg_install_commands(system_name: str) -> list[str]:
         if system_name == "windows":
             return [
-                "winget install -e --id Gyan.FFmpeg",
+                "winget install \"FFmpeg (Essentials Build)\"",
                 "choco install ffmpeg -y",
                 "scoop install ffmpeg",
             ]
