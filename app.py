@@ -534,7 +534,9 @@ class DownloaderApp:
             return None
 
         ydl_opts = {
-            "outtmpl": os.path.join(destination, "%(title)s.%(ext)s"),
+            # Include the video id so two videos with the same title never
+            # collide on disk (yt-dlp would otherwise skip the second one).
+            "outtmpl": os.path.join(destination, "%(title)s [%(id)s].%(ext)s"),
             "noplaylist": mode == "single",
             "ignoreerrors": True,
             "progress_hooks": [hook],
